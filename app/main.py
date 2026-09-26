@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, Query, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import db
@@ -22,6 +25,8 @@ from .schemas import (
     EventListOut,
     EventWithAckOut,
     ThresholdsOut,
+    TurbidityExposureIn,
+    TurbidityExposureOut,
     ConflictError,
     NotFoundError,
 )
@@ -74,6 +79,25 @@ def handle_not_found(_request, exc: NotFoundError) -> JSONResponse:
     return JSONResponse(
         status_code=status.HTTP_404_NOT_FOUND,
         content={"detail": exc.detail},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+def handle_request_validation(
+    _request, exc: RequestValidationError
+) -> JSONResponse:
+    # A rejected non-finite float (infinity/NaN) otherwise stays embedded as
+    # the error's raw ``input`` and crashes the default handler while it
+    # serializes the 422 body; replace those inputs with their text form so
+    # malformed values still get the standard 422 response.
+    detail = jsonable_encoder(exc.errors())
+    for error in detail:
+        value = error.get("input")
+        if isinstance(value, float) and not math.isfinite(value):
+            error["input"] = str(value)
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": detail},
     )
 
 
@@ -239,6 +263,40 @@ def acknowledge_event(
     return service.acknowledge_event(
         device_id=device_id.strip(),
         event_id=event_id,
+        payload=payload,
+    )
+
+
+@app.post(
+    "/devices/{device_id}/turbidity-exposure",
+    response_model=TurbidityExposureOut,
+    tags=["exposure"],
+)
+def turbidity_exposure(
+    device_id: str,
+    payload: TurbidityExposureIn,
+    service: Annotated[WaterQualityService, Depends(get_service)],
+) -> TurbidityExposureOut:
+    """
+    Cumulative over-threshold turbidity exposure over one time window.
+
+    The request carries a timezone-aware ``from``/``to`` window (``from``
+    strictly before ``to``) and a non-negative finite ``threshold``. From
+    one consistent read-only snapshot the device's raw samples are ordered
+    by (sampled_at, sequence) -- same-timestamp samples collapse to the
+    highest sequence -- and only adjacent samples at most
+    max_sample_gap_seconds apart are connected by linear interpolation;
+    nothing is extrapolated before the first or after the last sample.
+    Each segment is clipped to [from, to] and split at its threshold
+    crossings: the response sums the interpolated span lengths
+    (``covered_seconds``), the time strictly above the threshold
+    (``exceedance_seconds``) and the area of turbidity minus threshold
+    (``excess_integral``, turbidity * seconds). Without any covered span
+    all three are zero. The query is read-only and never writes events,
+    acknowledgements or change-stream rows.
+    """
+    return service.get_turbidity_exposure(
+        device_id=device_id.strip(),
         payload=payload,
     )
 

@@ -132,6 +132,51 @@ class CoincidentAlarmsIn(BaseModel):
         return self
 
 
+class TurbidityExposureIn(BaseModel):
+    """Time-windowed cumulative over-threshold turbidity exposure query.
+
+    ``from_``/``to`` must both be timezone-aware (normalized to UTC) with
+    ``from_`` strictly before ``to``; ``threshold`` is a non-negative finite
+    turbidity level. The response integrates the piecewise-linear raw sample
+    trace clipped to this window, counting time strictly above the threshold
+    and the area of the excess.
+    """
+
+    from_: datetime = Field(alias="from", examples=["2026-09-23T08:00:00Z"])
+    to: datetime = Field(examples=["2026-09-23T09:00:00Z"])
+    threshold: float = Field(ge=0.0, examples=[10.0])
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    @field_validator("from_", "to")
+    @classmethod
+    def require_aware_timestamp(cls, value: datetime) -> datetime:
+        return _aware_utc_timestamp(value)
+
+    @field_validator("threshold")
+    @classmethod
+    def reject_non_finite(cls, value: float) -> float:
+        return _finite_turbidity(value)
+
+    @model_validator(mode="after")
+    def validate_window(self) -> "TurbidityExposureIn":
+        if self.from_ >= self.to:
+            raise ValueError("from must be before to")
+        return self
+
+
+class TurbidityExposureOut(BaseModel):
+    device_id: str
+    from_: datetime = Field(alias="from")
+    to: datetime
+    threshold: float
+    covered_seconds: float
+    exceedance_seconds: float
+    excess_integral: float
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class EventOut(BaseModel):
     event_id: str
     device_id: str

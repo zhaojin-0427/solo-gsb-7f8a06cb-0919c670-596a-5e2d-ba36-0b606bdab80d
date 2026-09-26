@@ -29,6 +29,8 @@ from .schemas import (
     SampleFactOut,
     SampleIn,
     ThresholdsOut,
+    TurbidityExposureIn,
+    TurbidityExposureOut,
     ConflictError,
     NotFoundError,
 )
@@ -672,6 +674,106 @@ class WaterQualityService:
                 )
                 for start, end, devices in merged_spans
             ],
+        )
+
+    def get_turbidity_exposure(
+        self, device_id: str, payload: TurbidityExposureIn
+    ) -> TurbidityExposureOut:
+        """Integrate over-threshold turbidity exposure over [from, to].
+
+        One consistent read-only snapshot fetches the effective maximum
+        sample gap and every raw sample of the device. Samples sharing one
+        timestamp collapse to the highest sequence; only adjacent samples at
+        most max_sample_gap_seconds apart are connected by linear
+        interpolation, and nothing is extrapolated before the first or after
+        the last sample. Each segment is clipped to the window and split at
+        its threshold crossings: ``covered_seconds`` sums the interpolated
+        span lengths inside the window, ``exceedance_seconds`` the time
+        strictly above the threshold, and ``excess_integral`` the area of
+        turbidity minus threshold (turbidity * seconds). Without any covered
+        span all three are zero. The query never writes events,
+        acknowledgements or change-stream rows; late writes and corrections
+        are reflected by the next call.
+        """
+        window_start = payload.from_
+        window_end = payload.to
+        threshold = float(payload.threshold)
+        with self._write_lock, db.read_transaction(self._connection):
+            max_gap_seconds = int(
+                db.get_meta(self._connection, META_MAX_SAMPLE_GAP)
+                or self._settings.max_sample_gap_seconds
+            )
+            samples = self._load_raw_samples(device_id)
+
+        # Samples sharing one timestamp keep the highest sequence; ordering
+        # by (sampled_at, sequence) makes the last row per instant that one.
+        collapsed: list[_RawSample] = []
+        for sample in samples:
+            if collapsed and collapsed[-1].instant == sample.instant:
+                collapsed[-1] = sample
+            else:
+                collapsed.append(sample)
+
+        covered_seconds = 0.0
+        exceedance_seconds = 0.0
+        excess_integral = 0.0
+        max_gap = timedelta(seconds=max_gap_seconds)
+        for first, second in zip(collapsed, collapsed[1:]):
+            if second.instant - first.instant > max_gap:
+                # The gap is too wide to claim continuity; no interpolation
+                # across it. A gap of exactly the limit still interpolates.
+                continue
+            span_start = max(first.instant, window_start)
+            span_end = min(second.instant, window_end)
+            if span_start >= span_end:
+                continue
+            span_seconds = (span_end - span_start).total_seconds()
+            duration = (second.instant - first.instant).total_seconds()
+            value_start = first.turbidity + (
+                second.turbidity - first.turbidity
+            ) * (span_start - first.instant).total_seconds() / duration
+            value_end = first.turbidity + (
+                second.turbidity - first.turbidity
+            ) * (span_end - first.instant).total_seconds() / duration
+            covered_seconds += span_seconds
+
+            # Split the clipped span at every threshold crossing, then judge
+            # each linear piece by its midpoint: pieces strictly above the
+            # threshold contribute their length and the trapezoid area of
+            # the excess. A flat span exactly at the threshold never
+            # exceeds and contributes nothing.
+            breaks = [span_start, span_end]
+            if value_start != value_end:
+                fraction = (threshold - value_start) / (value_end - value_start)
+                if 0.0 < fraction < 1.0:
+                    breaks.insert(1, span_start + timedelta(
+                        seconds=fraction * span_seconds
+                    ))
+            for piece_start, piece_end in zip(breaks, breaks[1:]):
+                piece_seconds = (piece_end - piece_start).total_seconds()
+                if piece_seconds <= 0.0:
+                    continue
+                piece_value_start = value_start + (
+                    value_end - value_start
+                ) * (piece_start - span_start).total_seconds() / span_seconds
+                piece_value_end = value_start + (
+                    value_end - value_start
+                ) * (piece_end - span_start).total_seconds() / span_seconds
+                if (piece_value_start + piece_value_end) / 2.0 > threshold:
+                    exceedance_seconds += piece_seconds
+                    excess_integral += (
+                        piece_value_start - threshold
+                        + piece_value_end - threshold
+                    ) / 2.0 * piece_seconds
+
+        return TurbidityExposureOut(
+            device_id=device_id,
+            from_=window_start,
+            to=window_end,
+            threshold=threshold,
+            covered_seconds=covered_seconds,
+            exceedance_seconds=exceedance_seconds,
+            excess_integral=excess_integral,
         )
 
     def _rebuild_device(
