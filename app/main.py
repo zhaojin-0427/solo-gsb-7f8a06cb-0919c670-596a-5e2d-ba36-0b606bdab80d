@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, Query, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import db
@@ -22,6 +25,8 @@ from .schemas import (
     EventListOut,
     EventWithAckOut,
     ThresholdsOut,
+    TurbidityExposureIn,
+    TurbidityExposureOut,
     ConflictError,
     NotFoundError,
 )
@@ -66,6 +71,35 @@ def handle_conflict(_request, exc: ConflictError) -> JSONResponse:
     return JSONResponse(
         status_code=status.HTTP_409_CONFLICT,
         content={"detail": exc.detail},
+    )
+
+
+def _json_safe(value):
+    """Make a validation-error payload renderable as strict JSON.
+
+    Python's JSON parser accepts the non-standard NaN/Infinity literals,
+    so a request can carry a non-finite float that pydantic then rejects;
+    the offending value is echoed inside the error details, where the
+    strict JSON renderer (allow_nan=False) could not serialize it and the
+    422 response itself would fail. Such floats are rendered as their
+    string form instead; every other payload is returned unchanged.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+def handle_request_validation(
+    _request, exc: RequestValidationError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _json_safe(jsonable_encoder(exc.errors()))},
     )
 
 
@@ -239,6 +273,39 @@ def acknowledge_event(
     return service.acknowledge_event(
         device_id=device_id.strip(),
         event_id=event_id,
+        payload=payload,
+    )
+
+
+@app.post(
+    "/devices/{device_id}/turbidity-exposure",
+    response_model=TurbidityExposureOut,
+    tags=["measurements"],
+)
+def turbidity_exposure(
+    device_id: str,
+    payload: TurbidityExposureIn,
+    service: Annotated[WaterQualityService, Depends(get_service)],
+) -> TurbidityExposureOut:
+    """
+    Accumulate above-threshold turbidity exposure over one time window.
+
+    The request carries a timezone-aware [from, to] window (from < to)
+    and a non-negative finite threshold. The device's raw samples are
+    read in (sampled_at, sequence) order from one consistent read-only
+    snapshot, collapsing same-instant samples to the highest sequence.
+    Adjacent points at most max_sample_gap_seconds apart are joined by
+    linear interpolation; wider gaps and the ranges before the first and
+    after the last sample are never inferred. Segments are clipped to
+    [from, to] and split at their threshold crossings, yielding
+    covered_seconds, exceedance_seconds and excess_integral (the area
+    above the threshold, in turbidity*seconds) with fractional seconds
+    preserved; all three are 0 when nothing covers the window. The query
+    is read-only and never touches samples, events, acknowledgements or
+    the change stream.
+    """
+    return service.turbidity_exposure(
+        device_id=device_id.strip(),
         payload=payload,
     )
 

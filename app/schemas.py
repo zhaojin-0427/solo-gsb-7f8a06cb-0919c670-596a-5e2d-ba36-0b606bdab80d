@@ -132,6 +132,40 @@ class CoincidentAlarmsIn(BaseModel):
         return self
 
 
+class TurbidityExposureIn(BaseModel):
+    """Above-threshold turbidity exposure query for one device.
+
+    ``from``/``to`` bound the computation window: both must be
+    timezone-aware and are normalized to UTC, with ``from`` strictly
+    before ``to``. ``threshold`` is the non-negative finite turbidity
+    level the exposure is accumulated against.
+    """
+
+    from_: datetime = Field(alias="from", examples=["2026-09-23T08:00:00Z"])
+    to: datetime = Field(examples=["2026-09-23T09:00:00Z"])
+    threshold: float = Field(ge=0.0, examples=[10.0])
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    @field_validator("from_", "to")
+    @classmethod
+    def require_aware_timestamp(cls, value: datetime) -> datetime:
+        return _aware_utc_timestamp(value)
+
+    @field_validator("threshold")
+    @classmethod
+    def reject_non_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("threshold must be a finite number")
+        return value
+
+    @model_validator(mode="after")
+    def validate_window(self) -> "TurbidityExposureIn":
+        if self.from_ >= self.to:
+            raise ValueError("from must be before to")
+        return self
+
+
 class EventOut(BaseModel):
     event_id: str
     device_id: str
@@ -295,6 +329,28 @@ class CoincidentAlarmsOut(BaseModel):
     quorum: int
     device_ids: list[str]
     segments: list[CoincidentSegmentOut]
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class TurbidityExposureOut(BaseModel):
+    """Cumulative above-threshold turbidity exposure over one window.
+
+    ``covered_seconds`` is the total time within [from, to] covered by
+    interpolated segments; ``exceedance_seconds`` is the part of it where
+    the interpolated turbidity is above ``threshold``; ``excess_integral``
+    is the area between the interpolated curve and the threshold while
+    above it, in turbidity*seconds. All three keep fractional seconds and
+    are 0 when no segment covers the window.
+    """
+
+    device_id: str
+    from_: datetime = Field(alias="from")
+    to: datetime
+    threshold: float
+    covered_seconds: float
+    exceedance_seconds: float
+    excess_integral: float
 
     model_config = ConfigDict(populate_by_name=True)
 

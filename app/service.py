@@ -29,6 +29,8 @@ from .schemas import (
     SampleFactOut,
     SampleIn,
     ThresholdsOut,
+    TurbidityExposureIn,
+    TurbidityExposureOut,
     ConflictError,
     NotFoundError,
 )
@@ -672,6 +674,103 @@ class WaterQualityService:
                 )
                 for start, end, devices in merged_spans
             ],
+        )
+
+    def turbidity_exposure(
+        self, device_id: str, payload: TurbidityExposureIn
+    ) -> TurbidityExposureOut:
+        """Accumulate above-threshold turbidity exposure over one window.
+
+        The device's raw samples and the effective max sample gap are read
+        from one consistent read-only snapshot. Samples sharing an instant
+        are collapsed to the one with the highest sequence; adjacent points
+        at most max_sample_gap_seconds apart are joined by linear
+        interpolation, while wider gaps and the ranges before the first and
+        after the last sample stay unobserved. Every segment is clipped to
+        [from, to] and split at its threshold crossings, so the exceedance
+        time and the excess area follow the interpolated line exactly,
+        fractional seconds included. The query never writes samples,
+        events, acknowledgements or change-stream rows; writes committed
+        after the snapshot are reflected by the next call.
+        """
+        with self._write_lock, db.read_transaction(self._connection):
+            max_gap_seconds = int(
+                db.get_meta(self._connection, META_MAX_SAMPLE_GAP)
+                or self._settings.max_sample_gap_seconds
+            )
+            samples = self._load_raw_samples(device_id)
+
+        window_start = payload.from_
+        window_end = payload.to
+        threshold = float(payload.threshold)
+        max_gap = timedelta(seconds=max_gap_seconds)
+
+        # Collapse samples sharing one instant to the highest-sequence
+        # one. Sorting by the parsed instant (not the stored text) keeps
+        # fractional-second timestamps in their true chronological order.
+        points: list[_RawSample] = []
+        for sample in sorted(
+            samples, key=lambda item: (item.instant, item.sequence)
+        ):
+            if points and sample.instant == points[-1].instant:
+                points[-1] = sample
+            else:
+                points.append(sample)
+
+        covered_seconds = 0.0
+        exceedance_seconds = 0.0
+        excess_integral = 0.0
+        for first, second in zip(points, points[1:]):
+            # The gap check compares exact instants; only the interpolation
+            # itself is done in float seconds.
+            if second.instant - first.instant > max_gap:
+                continue
+            low = max(first.instant, window_start)
+            high = min(second.instant, window_end)
+            if high <= low:
+                continue
+            span_seconds = (second.instant - first.instant).total_seconds()
+            duration = (high - low).total_seconds()
+            low_value = first.turbidity + (
+                second.turbidity - first.turbidity
+            ) * ((low - first.instant).total_seconds() / span_seconds)
+            high_value = first.turbidity + (
+                second.turbidity - first.turbidity
+            ) * ((high - first.instant).total_seconds() / span_seconds)
+            covered_seconds += duration
+
+            low_above = low_value > threshold
+            high_above = high_value > threshold
+            if low_above and high_above:
+                exceedance_seconds += duration
+                excess_integral += (
+                    (low_value - threshold) + (high_value - threshold)
+                ) / 2.0 * duration
+            elif low_above or high_above:
+                # The line crosses the threshold once inside the clipped
+                # segment; the above-threshold part is a right triangle.
+                cross = (
+                    (threshold - low_value)
+                    / (high_value - low_value)
+                    * duration
+                )
+                if high_above:
+                    above_duration = duration - cross
+                    peak_excess = high_value - threshold
+                else:
+                    above_duration = cross
+                    peak_excess = low_value - threshold
+                exceedance_seconds += above_duration
+                excess_integral += 0.5 * above_duration * peak_excess
+
+        return TurbidityExposureOut(
+            device_id=device_id,
+            from_=window_start,
+            to=window_end,
+            threshold=threshold,
+            covered_seconds=covered_seconds,
+            exceedance_seconds=exceedance_seconds,
+            excess_integral=excess_integral,
         )
 
     def _rebuild_device(
